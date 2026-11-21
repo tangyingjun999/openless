@@ -1,4 +1,5 @@
 @preconcurrency import KeyboardKit
+import Darwin
 import OpenLessShared
 import SwiftUI
 import UIKit
@@ -2635,7 +2636,27 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
 
   /// DEBUG-ONLY (side-loaded fork build): makes the shared-container failure
   /// readable on-device, without a console: g=direct group container, h=host-derived
-  /// fallback group container, id=configured group, e=thrown error.
+  /// fallback group container, id=configured group, used=group App Group resolution
+  /// settled on, ent=app groups found in our own signature, aid=application
+  /// identifier, e=thrown error.
+  /// Reads one entitlement out of the running process' own code signature. A
+  /// re-signed build lives or dies by whether the signature really carries
+  /// `com.apple.security.application-groups`, and that is invisible in the UI.
+  private static func signedEntitlement(_ key: String) -> Any? {
+    guard let handle = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY),
+      let createSymbol = dlsym(handle, "SecTaskCreateFromSelf"),
+      let copySymbol = dlsym(handle, "SecTaskCopyValueForEntitlement")
+    else { return nil }
+    typealias Create = @convention(c) () -> Unmanaged<CFTypeRef>?
+    typealias Copy = @convention(c) (CFTypeRef, CFString, UnsafeMutableRawPointer?) -> Unmanaged<CFTypeRef>?
+    let create = unsafeBitCast(createSymbol, to: Create.self)
+    let copy = unsafeBitCast(copySymbol, to: Copy.self)
+    guard let created = create() else { return nil }
+    let task = created.takeRetainedValue()
+    defer { CFRelease(task) }
+    return copy(task, key as CFString, nil)?.takeRetainedValue()
+  }
+
   private var mailboxDiagnostic: String {
     let configured = Bundle.main.object(forInfoDictionaryKey: "OLAppGroupIdentifier") as? String
       ?? "group.app.openless.ios"
@@ -2649,8 +2670,13 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
       .containerURL(forSecurityApplicationGroupIdentifier: configured) != nil
     let fallback = FileManager.default
       .containerURL(forSecurityApplicationGroupIdentifier: "group." + host) != nil
+    let groups = KeyboardViewController.signedEntitlement("com.apple.security.application-groups")
+      as? [String] ?? []
+    let identifier = KeyboardViewController.signedEntitlement("application-identifier") as? String ?? "-"
     let reason = mailboxError.map { " e=" + String(describing: $0) } ?? ""
-    return "\n[diag g=\(direct ? 1 : 0) h=\(fallback ? 1 : 0) id=\(configured)]\(reason)"
+    return "\n[diag g=\(direct ? 1 : 0) h=\(fallback ? 1 : 0) id=\(configured)"
+      + " used=\(SharedContainer.identifier) ent=\(groups.joined(separator: "+"))"
+      + " aid=\(identifier)]\(reason)"
   }
 
   private func explainVoiceAvailability() {
