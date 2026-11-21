@@ -2521,13 +2521,15 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
     helpPrompt.isHidden = !help || overlayVisible
     updateVoiceGeometry()
     updateStyleMenu()
-    let canOpenHost = hasFullAccess && mailbox != nil && target != nil && !localPhase.isBusy
-    // Keep the three tools tappable. A disabled button cannot explain why it
-    // does nothing, which is exactly what "左边的按钮不管用" looked like; the
-    // handlers now surface the missing configuration instead. They still need a
-    // reachable host (or a live session) before they can do anything at all.
-    helpWriteButton.isEnabled = hasFullAccess && !localPhase.isBusy && (canStart || canOpenHost)
-    translationButton.isEnabled = hasFullAccess && !localPhase.isBusy && (canStart || canOpenHost)
+    // Keep the three side tools tappable. A disabled control cannot explain why
+    // it does nothing, and that is exactly what "左边的按钮不管用" looked like:
+    // both tools were gated on a reachable host, so with the host unreachable
+    // they greyed out and swallowed every tap. They stay enabled now and the
+    // handlers surface the reason (full access, missing configuration, or a host
+    // that needs opening) instead of staying silent. Clipboard paste only needs
+    // full access, so it never waits on the host at all.
+    helpWriteButton.isEnabled = hasFullAccess && !localPhase.isBusy
+    translationButton.isEnabled = hasFullAccess && !localPhase.isBusy
     clipboardButton.isEnabled = hasFullAccess && !localPhase.isBusy
     let helpWriteReady = configuredCapabilities?.canHelpWrite == true
     let translateReady = configuredCapabilities?.canTranslate == true
