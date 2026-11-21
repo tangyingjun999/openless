@@ -89,6 +89,16 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
   private let helpWriteButton = UIButton(type: .system)
   private let translationButton = UIButton(type: .system)
   private let atButton = UIButton(type: .system)
+  // Clipboard: tap pastes the current pasteboard, long press opens the recent list.
+  private let clipboardButton = UIButton(type: .system)
+  private let clipboardScroll = UIScrollView()
+  private let clipboardPanel = UIStackView()
+  private var clipboardOpen = false
+  private var clipboardHoldHandled = false
+  private var translationHoldMoved = false
+  private var clipboardHistory: [String] = []
+  private static let clipboardHistoryKey = "keyboardClipboardHistory"
+  private static let clipboardHistoryLimit = 20
   private let styleButton = UIButton(type: .system)
   private let proposalButton = UIButton(type: .system)
   private let undoButton = UIButton(type: .system)
@@ -229,6 +239,7 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
     loadRime()
     reconnect()
     rebuildKeys()
+    loadClipboardHistory()
     setPage(preferences.opensVoicePage, animated: false)
   }
   override func viewWillAppear(_ animated: Bool) {
@@ -256,6 +267,7 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
     keyboardIsVisible = false
     commitComposition()
     stopForDestinationChange()
+    closeClipboardPanel()
     libraryDocumentID = nil
     endDelete()
     cancelSpaceGesture()
@@ -828,7 +840,8 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
   private func setupVideoControls() {
     for (button, symbol, title) in [(helpWriteButton, "pencil.and.outline", "帮我写"),
       (translationButton, "character.bubble", "翻译：按住并向上滑动选择，也可点按选择"),
-      (atButton, "at", "输入 @"), (undoButton, "arrow.uturn.backward", "撤销")] {
+      (atButton, "at", "输入 @"), (undoButton, "arrow.uturn.backward", "撤销"),
+      (clipboardButton, "doc.on.clipboard", "剪贴板：点按粘贴，长按查看最近记录")] {
       button.setImage(UIImage(systemName: symbol), for: .normal)
       button.tintColor = .label
       button.backgroundColor = KeyboardStyle.key
@@ -850,7 +863,34 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
     translationButton.addAction(UIAction { [weak self] _ in self?.showTranslationArc() }, for: .touchUpInside)
     let hold = UILongPressGestureRecognizer(target: self, action: #selector(translationHold(_:)))
     hold.minimumPressDuration = 0.3
+    // A slow tap must still reach the button: without this the recogniser
+    // cancels the touch and the ring never opens.
+    hold.cancelsTouchesInView = false
     translationButton.addGestureRecognizer(hold)
+    clipboardButton.accessibilityIdentifier = "keyboardClipboard"
+    clipboardButton.addAction(UIAction { [weak self] _ in self?.pasteClipboard() }, for: .touchUpInside)
+    let clipboardHold = UILongPressGestureRecognizer(target: self, action: #selector(clipboardHold(_:)))
+    clipboardHold.minimumPressDuration = 0.4
+    clipboardHold.cancelsTouchesInView = false
+    clipboardButton.addGestureRecognizer(clipboardHold)
+    clipboardScroll.showsHorizontalScrollIndicator = false
+    clipboardScroll.translatesAutoresizingMaskIntoConstraints = false
+    clipboardScroll.isHidden = true
+    clipboardScroll.accessibilityIdentifier = "keyboardClipboardHistory"
+    clipboardPanel.axis = .horizontal
+    clipboardPanel.spacing = 6
+    clipboardPanel.alignment = .center
+    clipboardPanel.translatesAutoresizingMaskIntoConstraints = false
+    clipboardScroll.addSubview(clipboardPanel)
+    voice.addSubview(clipboardScroll)
+    NSLayoutConstraint.activate([
+      clipboardPanel.leadingAnchor.constraint(equalTo: clipboardScroll.contentLayoutGuide.leadingAnchor, constant: 8),
+      clipboardPanel.trailingAnchor.constraint(equalTo: clipboardScroll.contentLayoutGuide.trailingAnchor, constant: -8),
+      clipboardPanel.topAnchor.constraint(equalTo: clipboardScroll.contentLayoutGuide.topAnchor),
+      clipboardPanel.bottomAnchor.constraint(equalTo: clipboardScroll.contentLayoutGuide.bottomAnchor),
+      clipboardPanel.heightAnchor.constraint(equalTo: clipboardScroll.frameLayoutGuide.heightAnchor),
+      clipboardScroll.heightAnchor.constraint(equalToConstant: 44),
+    ])
     helpPrompt.text = "描述要写的内容\n再次点击以完成"
     helpPrompt.font = KeyboardStyle.detailFont
     helpPrompt.adjustsFontForContentSizeCategory = false
@@ -901,6 +941,11 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
       voiceTools.heightAnchor.constraint(equalToConstant: 48),
       translationButton.leadingAnchor.constraint(equalTo: voiceTools.leadingAnchor),
       translationButton.bottomAnchor.constraint(equalTo: voiceTools.topAnchor, constant: -12),
+      clipboardButton.leadingAnchor.constraint(equalTo: voiceTools.leadingAnchor),
+      clipboardButton.bottomAnchor.constraint(equalTo: translationButton.topAnchor, constant: -12),
+      clipboardScroll.leadingAnchor.constraint(equalTo: voice.leadingAnchor),
+      clipboardScroll.trailingAnchor.constraint(equalTo: voice.trailingAnchor),
+      clipboardScroll.bottomAnchor.constraint(equalTo: voiceTools.topAnchor, constant: -8),
       voiceDelete.trailingAnchor.constraint(equalTo: voiceTools.trailingAnchor),
       voiceDelete.bottomAnchor.constraint(equalTo: voiceTools.topAnchor, constant: -12),
       helpPrompt.leadingAnchor.constraint(equalTo: voice.leadingAnchor, constant: 90),
@@ -937,7 +982,14 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
     guard raw || configuredCapabilities?.allows(intent) == true else {
       voiceFailureFeedback()
       notice = selectedStyleRequiresSetup ? "此风格需要文字模型，请在 OpenLess 中配置。" : "请先在 OpenLess 中完成设置。"
-      refreshVoice(); return
+      refreshVoice()
+      UIAccessibility.post(notification: .announcement, argument: notice)
+      // 帮我写 needs a text model; without one the tap used to do nothing at
+      // all. Send the user straight to the page that configures it.
+      if intent.kind == .helpWrite, let url = URL(string: "openless-ios://styles") {
+        openContainingApp(url)
+      }
+      return
     }
     if let capabilities, capabilities.allows(intent), snapshot.canStart, snapshot.inForeground || snapshot.backgroundReady {
       beginVoice(intent: intent, capabilities: capabilities)
@@ -948,9 +1000,16 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
     }
   }
   private func showTranslationArc() {
-    guard !localPhase.isBusy, let capabilities = configuredCapabilities, capabilities.canTranslate,
+    guard !localPhase.isBusy else { return }
+    if !translationArc.isHidden { return }
+    guard let capabilities = configuredCapabilities, capabilities.canTranslate,
       !capabilities.translationTargets.isEmpty else {
-      notice = "翻译尚未可用，请在 OpenLess 中配置并启用。"; refreshVoice(); return
+      // A disabled button used to swallow the tap without any explanation.
+      voiceFailureFeedback()
+      notice = "翻译还没配置：请在 OpenLess 里添加翻译目标并启用。"
+      refreshVoice()
+      UIAccessibility.post(notification: .announcement, argument: notice)
+      return
     }
     translationArc.begin(targets: capabilities.translationTargets)
     translationArc.isHidden = false
@@ -1036,9 +1095,16 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
   }
   @objc private func translationHold(_ recognizer: UILongPressGestureRecognizer) {
     switch recognizer.state {
-    case .began: showTranslationArc()
-    case .changed: moveTranslationSelection(to: recognizer.location(in: translationArc))
+    case .began:
+      translationHoldMoved = false
+      showTranslationArc()
+    case .changed:
+      translationHoldMoved = true
+      moveTranslationSelection(to: recognizer.location(in: translationArc))
     case .ended:
+      // A press that never moved is a tap: leave the ring open so the user can
+      // pick a target by tapping it. Only a real drag commits the release point.
+      guard translationHoldMoved else { return }
       // UIKit may deliver a final location without a matching .changed event.
       // Recheck the release point so moving into the cancel area never commits
       // the target selected by an earlier event.
@@ -2406,6 +2472,8 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
     let help = activeStart?.intent.kind == .helpWrite && localPhase == .recording
     let choosingTranslation = !translationArc.isHidden
     let overlayVisible = choosingTranslation || pendingGeneratedPreview != nil
+    // The history strip only lives on the idle voice page.
+    if clipboardOpen && (localPhase.isBusy || overlayVisible) { closeClipboardPanel() }
     if activeClient == nil, [.error, .cancelled, .done, .inactive].contains(localPhase) {
       spaceVoiceOverlay.dismiss(); spaceSessionID = nil; spaceFinish = nil; submitIntent = nil
       awaitingSpaceTranslation = false
@@ -2454,17 +2522,25 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
     updateVoiceGeometry()
     updateStyleMenu()
     let canOpenHost = hasFullAccess && mailbox != nil && target != nil && !localPhase.isBusy
-    helpWriteButton.isEnabled = (canStart || canOpenHost) && configuredCapabilities?.canHelpWrite == true
-    translationButton.isEnabled = (canStart || canOpenHost) && configuredCapabilities?.canTranslate == true
+    // Keep the three tools tappable. A disabled button cannot explain why it
+    // does nothing, which is exactly what "左边的按钮不管用" looked like; the
+    // handlers now surface the missing configuration instead. They still need a
+    // reachable host (or a live session) before they can do anything at all.
+    helpWriteButton.isEnabled = hasFullAccess && !localPhase.isBusy && (canStart || canOpenHost)
+    translationButton.isEnabled = hasFullAccess && !localPhase.isBusy && (canStart || canOpenHost)
+    clipboardButton.isEnabled = hasFullAccess && !localPhase.isBusy
+    let helpWriteReady = configuredCapabilities?.canHelpWrite == true
+    let translateReady = configuredCapabilities?.canTranslate == true
       && configuredCapabilities?.translationTargets.isEmpty == false
-    helpWriteButton.accessibilityLabel = helpWriteButton.isEnabled ? "帮我写" : "帮我写不可用，请在 OpenLess 中配置"
-    translationButton.accessibilityLabel = translationButton.isEnabled ? "翻译" : "翻译不可用，请在 OpenLess 中配置"
-    helpWriteButton.accessibilityHint = helpWriteButton.isEnabled ? "描述要写的内容，不读取选区，不应用听写风格。" : "在 OpenLess 中设置文字模型。"
-    translationButton.accessibilityHint = translationButton.isEnabled ? "点按后可逐项选择，或按住向上滑动。" : "在 OpenLess 中添加翻译目标。"
+    helpWriteButton.accessibilityLabel = helpWriteReady ? "帮我写" : "帮我写不可用，请在 OpenLess 中配置"
+    translationButton.accessibilityLabel = translateReady ? "翻译" : "翻译不可用，请在 OpenLess 中配置"
+    helpWriteButton.accessibilityHint = helpWriteReady ? "描述要写的内容，不读取选区，不应用听写风格。" : "在 OpenLess 中设置文字模型。"
+    translationButton.accessibilityHint = translateReady ? "点按后可逐项选择，或按住向上滑动。" : "在 OpenLess 中添加翻译目标。"
     previewPanel.isHidden = pendingGeneratedPreview == nil
     // Hiding a UIControl cancels its tracked touch. Keep the speech control
     // attached beneath the arc until the selecting finger releases.
-    speak.isHidden = pendingGeneratedPreview != nil || (choosingTranslation && !speak.isSelectingTranslation)
+    speak.isHidden = pendingGeneratedPreview != nil
+      || (choosingTranslation && !speak.isSelectingTranslation) || clipboardOpen
     speak.layer.opacity = choosingTranslation ? 0 : 1
     if let preview = pendingGeneratedPreview { previewText.text = preview.text }
     let title = confirmedPreviewID == nil ? "插入" : "正在确认…"
@@ -2515,11 +2591,16 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
     translationButton.accessibilityLabel = uiText.text(translationButton.accessibilityLabel ?? "")
     translationButton.accessibilityHint = uiText.text(translationButton.accessibilityHint ?? "")
     cancelButton.isHidden = returnedHostActivation == nil && (!localPhase.isBusy || activeClient == nil)
-    [voiceDelete, voiceReturn, helpWriteButton]
-      .forEach { $0.isHidden = localPhase.isBusy || overlayVisible }
+    // The history strip owns the row above the tool row, so the two side tools
+    // step aside while it is open.
+    [voiceDelete, helpWriteButton]
+      .forEach { $0.isHidden = localPhase.isBusy || overlayVisible || clipboardOpen }
+    voiceReturn.isHidden = localPhase.isBusy || overlayVisible
+    clipboardButton.isHidden = localPhase.isBusy || overlayVisible
     // Keep the long-press recognizer's view attached and visible to UIKit while
     // its finger is down. Only suppress its drawing beneath the clear overlay.
-    translationButton.isHidden = localPhase.isBusy || pendingGeneratedPreview != nil || returnedHostActivation != nil
+    translationButton.isHidden = localPhase.isBusy || pendingGeneratedPreview != nil
+      || returnedHostActivation != nil || clipboardOpen
     translationButton.layer.opacity = choosingTranslation ? 0 : 1
     let invalidCapabilities = snapshot.capabilities.map { !$0.isValid } ?? false
     transcript.isHidden = overlayVisible || help || (localPhase == .processing && notice == nil)
@@ -2816,6 +2897,146 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
     }
     refreshVoice()
   }
+  // MARK: - Clipboard
+  private func clipboardPreview(_ text: String) -> String {
+    let flat = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+    return flat.count > 18 ? String(flat.prefix(18)) + "…" : flat
+  }
+
+  private func loadClipboardHistory() {
+    clipboardHistory = (UserDefaults.standard.array(forKey: Self.clipboardHistoryKey) as? [String] ?? [])
+      .filter { !$0.isEmpty }
+    if clipboardHistory.count > Self.clipboardHistoryLimit {
+      clipboardHistory = Array(clipboardHistory.prefix(Self.clipboardHistoryLimit))
+    }
+  }
+
+  private func recordClipboard(_ text: String) {
+    clipboardHistory.removeAll { $0 == text }
+    clipboardHistory.insert(text, at: 0)
+    if clipboardHistory.count > Self.clipboardHistoryLimit {
+      clipboardHistory.removeLast(clipboardHistory.count - Self.clipboardHistoryLimit)
+    }
+    UserDefaults.standard.set(clipboardHistory, forKey: Self.clipboardHistoryKey)
+  }
+
+  private func currentClipboardText() -> String? {
+    guard hasFullAccess else {
+      voiceFailureFeedback()
+      notice = "剪贴板需要“允许完全访问”"
+      refreshVoice()
+      UIAccessibility.post(notification: .announcement, argument: notice)
+      return nil
+    }
+    let text = (UIPasteboard.general.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else {
+      voiceFailureFeedback()
+      notice = "剪贴板里没有可粘贴的文字"
+      refreshVoice()
+      UIAccessibility.post(notification: .announcement, argument: notice)
+      return nil
+    }
+    return text
+  }
+
+  private func insertClipboard(_ text: String) {
+    closeClipboardPanel()
+    if activeClient != nil { stopForDestinationChange() }
+    commitComposition()
+    edit { textDocumentProxy.insertText(text) }
+    feedback(kind: .input)
+    refreshTypingCandidates()
+  }
+
+  private func pasteClipboard() {
+    // A long press that already opened the history list must not also paste.
+    if clipboardHoldHandled {
+      clipboardHoldHandled = false
+      return
+    }
+    guard let text = currentClipboardText() else { return }
+    recordClipboard(text)
+    insertClipboard(text)
+    notice = "已粘贴 " + String(text.count) + " 字：" + clipboardPreview(text)
+    refreshVoice()
+  }
+
+  @objc private func clipboardHold(_ recognizer: UILongPressGestureRecognizer) {
+    guard recognizer.state == .began else { return }
+    clipboardHoldHandled = true
+    toggleClipboardPanel()
+  }
+
+  private func toggleClipboardPanel() {
+    if clipboardOpen {
+      closeClipboardPanel()
+      refreshVoice()
+      return
+    }
+    guard hasFullAccess else {
+      voiceFailureFeedback()
+      notice = "剪贴板需要“允许完全访问”"
+      refreshVoice()
+      return
+    }
+    if activeClient != nil { stopForDestinationChange() }
+    hideTranslationArc()
+    rebuildClipboardPanel()
+    clipboardOpen = true
+    clipboardScroll.isHidden = false
+    clipboardScroll.contentOffset = .zero
+    feedback(kind: .control)
+    refreshVoice()
+    UIAccessibility.post(notification: .layoutChanged, argument: clipboardScroll)
+  }
+
+  private func closeClipboardPanel() {
+    guard clipboardOpen else { return }
+    clipboardOpen = false
+    clipboardScroll.isHidden = true
+    clipboardPanel.arrangedSubviews.forEach {
+      clipboardPanel.removeArrangedSubview($0)
+      $0.removeFromSuperview()
+    }
+  }
+
+  private func rebuildClipboardPanel() {
+    clipboardPanel.arrangedSubviews.forEach {
+      clipboardPanel.removeArrangedSubview($0)
+      $0.removeFromSuperview()
+    }
+    guard !clipboardHistory.isEmpty else {
+      let label = UILabel()
+      label.font = KeyboardStyle.detailFont
+      label.textColor = .secondaryLabel
+      label.numberOfLines = 1
+      label.text = uiText.text("还没有记录 · 点按剪贴板按钮即可粘贴")
+      clipboardPanel.addArrangedSubview(label)
+      return
+    }
+    for (index, text) in clipboardHistory.enumerated() {
+      let chip = UIButton(type: .system)
+      chip.setTitle(clipboardPreview(text), for: .normal)
+      chip.titleLabel?.font = .systemFont(ofSize: 14)
+      chip.titleLabel?.lineBreakMode = .byTruncatingTail
+      chip.setTitleColor(.label, for: .normal)
+      chip.backgroundColor = KeyboardStyle.key
+      chip.layer.cornerRadius = 16
+      chip.contentEdgeInsets = UIEdgeInsets(top: 0, left: 14, bottom: 0, right: 14)
+      chip.accessibilityIdentifier = "keyboardClipboardItem" + String(index)
+      chip.accessibilityLabel = "粘贴：" + String(text.prefix(40))
+      chip.heightAnchor.constraint(equalToConstant: 34).isActive = true
+      chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 56).isActive = true
+      chip.addAction(UIAction { [weak self] _ in
+        guard let self else { return }
+        self.insertClipboard(text)
+        self.notice = "已粘贴 " + String(text.count) + " 字：" + self.clipboardPreview(text)
+        self.refreshVoice()
+      }, for: .touchUpInside)
+      clipboardPanel.addArrangedSubview(chip)
+    }
+  }
+
   private func openContainingApp(_ url: URL) {
     let dispatched = urlBridge.open(url) { [weak self] accepted in
       NSLog("OPENLESS_HOST_URL accepted=%d destination=%@", accepted, url.host ?? "")
