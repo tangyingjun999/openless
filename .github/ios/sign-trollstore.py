@@ -20,8 +20,6 @@ import hashlib
 import json
 import os
 import plistlib
-import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -58,7 +56,7 @@ def dump_entitlements(bundle):
         ["codesign", "-d", "--entitlements", ":-", str(bundle)],
         check=True, capture_output=True, text=True,
     )
-    text = result.stdout.strip() or result.stderr.strip()
+    text = (result.stdout + result.stderr).strip()
     print(f"--- entitlements: {bundle.name}\n{text}", flush=True)
     return text
 
@@ -100,51 +98,46 @@ def package(app, output):
 
 
 def main():
-    derived = Path(os.environ["OPENLESS_DERIVED_DATA"])
+    derived = os.environ.get("OPENLESS_DERIVED_DATA")
+    if not derived:
+        derived = str(Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())) / "ios-device")
+    derived = Path(derived)
     workspace = Path(os.environ["GITHUB_WORKSPACE"])
-    source = derived / "Build/Products/Release-iphoneos/OpenLess.app"
-    if not source.is_dir():
-        raise SystemExit(f"missing device product: {source}")
-    out_dir = workspace / "out"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    app = derived / "Build/Products/Release-iphoneos/OpenLess.app"
+    if not app.is_dir():
+        raise SystemExit(f"missing device product: {app}")
 
-    with (source / "Info.plist").open("rb") as stream:
+    with (app / "Info.plist").open("rb") as stream:
         metadata = plistlib.load(stream)
     version = metadata["CFBundleShortVersionString"]
     build = metadata["CFBundleVersion"]
 
-    work = Path(tempfile.mkdtemp(prefix="openless-trollstore-"))
-    payload = work / "Payload"
-    payload.mkdir()
-    app = payload / "OpenLess.app"
-    shutil.copytree(source, app, symlinks=True)
+    ent_dir = Path(tempfile.mkdtemp(prefix="openless-entitlements-"))
 
-    ent_dir = work / "entitlements"
-    ent_dir.mkdir()
-
-    def write_entitlements(bundle):
+    def entitlements_file(bundle):
         path = ent_dir / (bundle.name + ".plist")
         with path.open("wb") as stream:
             plistlib.dump(entitlements(bundle_id(bundle)), stream)
         return path
 
-    # Inside out: nested frameworks, then extensions, then the app itself.
+    # Inside out: nested frameworks, then the extensions, then the app itself.
     sign_frameworks(app)
+    appexes = []
     plugins = app / "PlugIns"
     if plugins.is_dir():
-        for appex in sorted(p for p in plugins.iterdir() if p.suffix == ".appex"):
+        appexes = sorted(p for p in plugins.iterdir() if p.suffix == ".appex")
+        for appex in appexes:
             sign_frameworks(appex)
-            sign(appex, write_entitlements(appex))
-    sign(app, write_entitlements(app))
+            sign(appex, entitlements_file(appex))
+    sign(app, entitlements_file(app))
 
-    verified = [app] + ([p for p in sorted((app / "PlugIns").iterdir()) if p.suffix == ".appex"]
-                        if (app / "PlugIns").is_dir() else [])
-    for bundle in verified:
+    for bundle in [app] + appexes:
         dump_entitlements(bundle)
 
+    out_dir = workspace / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
     output = out_dir / f"OpenLess-{version}-{build}-trollstore.ipa"
     package(app, output)
-    shutil.rmtree(work, ignore_errors=True)
 
     with output.open("rb") as stream:
         checksum = digest(stream)
@@ -155,9 +148,8 @@ def main():
                       "sha256": checksum, "files": entries}, indent=2))
 
     sums = out_dir / "SHA256SUMS"
-    ipas = sorted(out_dir.glob("*.ipa"))
     with sums.open("w") as stream:
-        for ipa in ipas:
+        for ipa in sorted(out_dir.glob("*.ipa")):
             with ipa.open("rb") as handle:
                 stream.write(f"{digest(handle)}  ./{ipa.name}\n")
     print(sums.read_text())
