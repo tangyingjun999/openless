@@ -15,13 +15,15 @@ voice pipeline is unreachable.
 
 Baking the entitlement into an ad-hoc signature keeps it available to TrollStore
 / ldid without a developer certificate or a provisioning profile.
+
+The packaged bundle also gets its CFBundleVersion bumped by one so the installed
+build is distinguishable from the unsigned one in TrollStore's app info.
 """
 import hashlib
 import json
 import os
 import plistlib
 import subprocess
-import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -61,9 +63,21 @@ def dump_entitlements(bundle):
     return text
 
 
+def read_plist(path):
+    with path.open("rb") as stream:
+        return plistlib.load(stream)
+
+
+def bump_build(bundle, build):
+    info = bundle / "Info.plist"
+    metadata = read_plist(info)
+    metadata["CFBundleVersion"] = build
+    with info.open("wb") as stream:
+        plistlib.dump(metadata, stream)
+
+
 def bundle_id(bundle):
-    with (bundle / "Info.plist").open("rb") as stream:
-        return plistlib.load(stream)["CFBundleIdentifier"]
+    return read_plist(bundle / "Info.plist")["CFBundleIdentifier"]
 
 
 def sign_frameworks(container):
@@ -101,18 +115,31 @@ def main():
     derived = os.environ.get("OPENLESS_DERIVED_DATA")
     if not derived:
         derived = str(Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())) / "ios-device")
-    derived = Path(derived)
+    source = Path(derived) / "Build/Products/Release-iphoneos/OpenLess.app"
+    if not source.is_dir():
+        raise SystemExit(f"missing device product: {source}")
     workspace = Path(os.environ["GITHUB_WORKSPACE"])
-    app = derived / "Build/Products/Release-iphoneos/OpenLess.app"
-    if not app.is_dir():
-        raise SystemExit(f"missing device product: {app}")
 
-    with (app / "Info.plist").open("rb") as stream:
-        metadata = plistlib.load(stream)
-    version = metadata["CFBundleShortVersionString"]
-    build = metadata["CFBundleVersion"]
+    source_metadata = read_plist(source / "Info.plist")
+    version = source_metadata["CFBundleShortVersionString"]
+    build = str(int(source_metadata["CFBundleVersion"]) + 1)
 
-    ent_dir = Path(tempfile.mkdtemp(prefix="openless-entitlements-"))
+    work = Path(tempfile.mkdtemp(prefix="openless-trollstore-"))
+    payload = work / "Payload"
+    payload.mkdir()
+    app = payload / "OpenLess.app"
+    # ditto keeps the bundle layout while dropping resource forks, extended
+    # attributes and quarantine flags, which codesign refuses to seal.
+    run(["ditto", "--norsrc", "--noextattr", "--noqtn", str(source), str(app)])
+
+    plugins = app / "PlugIns"
+    appexes = sorted(p for p in plugins.iterdir() if p.suffix == ".appex") if plugins.is_dir() else []
+    for bundle in [app] + appexes:
+        bump_build(bundle, build)
+    print(f"packaging version {version} build {build}", flush=True)
+
+    ent_dir = work / "entitlements"
+    ent_dir.mkdir()
 
     def entitlements_file(bundle):
         path = ent_dir / (bundle.name + ".plist")
@@ -122,13 +149,9 @@ def main():
 
     # Inside out: nested frameworks, then the extensions, then the app itself.
     sign_frameworks(app)
-    appexes = []
-    plugins = app / "PlugIns"
-    if plugins.is_dir():
-        appexes = sorted(p for p in plugins.iterdir() if p.suffix == ".appex")
-        for appex in appexes:
-            sign_frameworks(appex)
-            sign(appex, entitlements_file(appex))
+    for appex in appexes:
+        sign_frameworks(appex)
+        sign(appex, entitlements_file(appex))
     sign(app, entitlements_file(app))
 
     for bundle in [app] + appexes:
@@ -138,6 +161,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     output = out_dir / f"OpenLess-{version}-{build}-trollstore.ipa"
     package(app, output)
+    print(f"built {output}", flush=True)
 
     with output.open("rb") as stream:
         checksum = digest(stream)

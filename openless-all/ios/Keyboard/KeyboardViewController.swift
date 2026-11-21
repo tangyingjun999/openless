@@ -14,6 +14,7 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
   private var preferences = KeyboardPreferences()
   private var deferredPreferences: KeyboardPreferences?
   private var mailbox: Mailbox?
+  private var mailboxError: Error?
   private var lastFullAccess: Bool?
   private var connectionRetryAfter = Date.distantPast
   private var observer: MailboxObserver?
@@ -381,7 +382,17 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
     let previous = preferences
     lastFullAccess = hasFullAccess
     connectionRetryAfter = Date().addingTimeInterval(5)
-    if hasFullAccess { mailbox = try? SharedContainer.openMailbox() } else { mailbox = nil }
+    if hasFullAccess {
+      do {
+        mailbox = try SharedContainer.openMailbox()
+        mailboxError = nil
+      } catch {
+        mailbox = nil
+        mailboxError = error
+      }
+    } else {
+      mailbox = nil; mailboxError = nil
+    }
     if let data = UserDefaults.standard.data(forKey: SharedContract.preferencesKey),
       let prefs = try? SharedContract.decode(KeyboardPreferences.self, from: data),
       prefs.version == 1
@@ -2622,12 +2633,32 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
     outputLanguageButton.menu = UIMenu(title: uiText.text("翻译输出语言"), children: actions)
   }
 
+  /// DEBUG-ONLY (side-loaded fork build): makes the shared-container failure
+  /// readable on-device, without a console: g=direct group container, h=host-derived
+  /// fallback group container, id=configured group, e=thrown error.
+  private var mailboxDiagnostic: String {
+    let configured = Bundle.main.object(forInfoDictionaryKey: "OLAppGroupIdentifier") as? String
+      ?? "group.app.openless.ios"
+    let point = (Bundle.main.object(forInfoDictionaryKey: "NSExtension") as? [String: Any])?
+      ["NSExtensionPointIdentifier"] as? String
+    var host = Bundle.main.bundleIdentifier ?? "unknown"
+    if point == "com.apple.keyboard-service", host.hasSuffix(".keyboard") {
+      host = String(host.dropLast(".keyboard".count))
+    }
+    let direct = FileManager.default
+      .containerURL(forSecurityApplicationGroupIdentifier: configured) != nil
+    let fallback = FileManager.default
+      .containerURL(forSecurityApplicationGroupIdentifier: "group." + host) != nil
+    let reason = mailboxError.map { " e=" + String(describing: $0) } ?? ""
+    return "\n[diag g=\(direct ? 1 : 0) h=\(fallback ? 1 : 0) id=\(configured)]\(reason)"
+  }
+
   private func explainVoiceAvailability() {
     refreshConnectionIfNeeded(force: true)
     if !hasFullAccess {
       notice = "设置 → OpenLess 键盘 → 允许完全访问\n仅语音需要此权限"
     } else if mailbox == nil {
-      notice = "完全访问已开启，但暂时无法连接 OpenLess。请打开主应用后重试。"
+      notice = "完全访问已开启，但暂时无法连接 OpenLess。请打开主应用后重试。" + mailboxDiagnostic
     } else if selectedStyleRequiresSetup {
       notice = "此风格需要文字模型，请在 OpenLess 中配置。"
       if let url = URL(string: "openless-ios://styles") { openContainingApp(url) }
