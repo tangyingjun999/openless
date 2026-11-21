@@ -49,6 +49,9 @@ jobs:
           set -o pipefail
           bash .github/ios/build-ipa.sh 2>&1 | tee "$RUNNER_TEMP/build.log"
 
+      - name: Ad-hoc sign for TrollStore (App Group entitlement baked in)
+        run: python3 .github/ios/sign-trollstore.py
+
       - name: Publish result (release asset)
         if: always()
         env:
