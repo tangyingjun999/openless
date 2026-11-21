@@ -2768,7 +2768,14 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
     if !hasFullAccess {
       notice = "设置 → OpenLess 键盘 → 允许完全访问\n仅语音需要此权限"
     } else if mailbox == nil {
-      notice = "完全访问已开启，但暂时无法连接 OpenLess。请打开主应用后重试。" + mailboxDiagnostic
+      // The notice line is a single truncating row, so a long readout never
+      // reaches the user's eyes ("看不全"). Park the full diagnostic on the
+      // pasteboard instead and say so: it can be pasted straight back to the
+      // person debugging this, and it also lands in the clipboard history.
+      let diagnostic = mailboxDiagnostic.trimmingCharacters(in: .whitespacesAndNewlines)
+      UIPasteboard.general.string = "OpenLess 键盘诊断 " + diagnostic
+      recordClipboard("OpenLess 键盘诊断 " + diagnostic)
+      notice = "无法连接 OpenLess · 诊断已复制，粘贴发我"
     } else if selectedStyleRequiresSetup {
       notice = "此风格需要文字模型，请在 OpenLess 中配置。"
       if let url = URL(string: "openless-ios://styles") { openContainingApp(url) }

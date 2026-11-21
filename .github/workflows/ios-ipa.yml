@@ -52,6 +52,8 @@ jobs:
       - name: Ad-hoc sign for TrollStore (App Group entitlement baked in)
         env:
           OPENLESS_DERIVED_DATA: ${{ runner.temp }}/ios-device
+          # Bump per release so TrollStore and iOS always see a new build.
+          OPENLESS_BUILD_OFFSET: "3"
         run: python3 .github/ios/sign-trollstore.py
 
       - name: Publish result (release asset)
