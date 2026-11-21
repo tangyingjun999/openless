@@ -2639,8 +2639,8 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
   private var mailboxDiagnostic: String {
     let configured = Bundle.main.object(forInfoDictionaryKey: "OLAppGroupIdentifier") as? String
       ?? "group.app.openless.ios"
-    let point = (Bundle.main.object(forInfoDictionaryKey: "NSExtension") as? [String: Any])?
-      ["NSExtensionPointIdentifier"] as? String
+    let extensionInfo = Bundle.main.object(forInfoDictionaryKey: "NSExtension") as? [String: Any]
+    let point = extensionInfo?["NSExtensionPointIdentifier"] as? String
     var host = Bundle.main.bundleIdentifier ?? "unknown"
     if point == "com.apple.keyboard-service", host.hasSuffix(".keyboard") {
       host = String(host.dropLast(".keyboard".count))
