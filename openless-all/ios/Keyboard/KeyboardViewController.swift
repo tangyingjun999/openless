@@ -2652,8 +2652,9 @@ final class KeyboardViewController: UIInputViewController, UIGestureRecognizerDe
     let create = unsafeBitCast(createSymbol, to: Create.self)
     let copy = unsafeBitCast(copySymbol, to: Copy.self)
     guard let created = create() else { return nil }
+    // takeRetainedValue hands ownership to ARC; Core Foundation objects are
+    // automatically memory managed on this platform, so no manual CFRelease.
     let task = created.takeRetainedValue()
-    defer { CFRelease(task) }
     return copy(task, key as CFString, nil)?.takeRetainedValue()
   }
 
